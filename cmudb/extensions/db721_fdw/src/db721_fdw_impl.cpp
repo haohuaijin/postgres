@@ -72,7 +72,7 @@ static db721ExecutionState* create_db721ExectionState(db721Metadata* meta, char*
 static bool fetchTupleAtIndex(db721ExecutionState* festate, int index, TupleTableSlot* tuple);	
 static int getInt4(FILE* table, int offest, bool* ok);
 static float getFloat4(FILE* table, int offest, bool* ok);
-static char* getString32(FILE* table, int offest, bool* ok, bool* isnull);
+static char* getString32(FILE* table, int offest, bool* ok);
 
 extern "C" void db721_GetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
                                       Oid foreigntableid) {
@@ -201,6 +201,16 @@ extern "C" void db721_EndForeignScan(ForeignScanState *node) {
 	 */
 	db721ExecutionState* festate = (db721ExecutionState*) node->fdw_state;
 	FreeFile(festate->table);
+	db721Metadata *meta = festate->meta;
+	for(auto it1 : *(meta->column_datas)){
+		for(auto it2 : *(it1.second->block_stats)){
+			pfree(it2.second);
+		}
+		delete it1.second->block_stats;
+		pfree(it1.second);
+	}
+	delete meta->column_datas;
+	pfree(meta);
 }
 
 static db721FdwOptions* db721GetOptions(Oid foreigntableid){
@@ -275,9 +285,6 @@ static db721Metadata* db721GetMetadata(db721FdwOptions* options){
 	return metadata;
 }
 
-/* 
- * parser db721 meta data
- */
 static db721Metadata* parserMetadata(char* metadata, int size){
 	int state = 0;
 	char key[32];
@@ -710,14 +717,7 @@ static bool fetchTupleAtIndex(db721ExecutionState* festate, int index, TupleTabl
 
 		bool ok = true;
 		if(strcmp(type, "str") == 0){
-			bool isnull = false;
-			char* str = getString32(festate->table, start_offest+index*32, &ok, &isnull);
-
-			if(isnull){
-				tuple->tts_isnull[i] = true;
-				break;
-			}
-
+			char* str = getString32(festate->table, start_offest+index*32, &ok);
 			tuple->tts_values[i] = PointerGetDatum(str);
 		} else if(strcmp(type, "int") == 0){
 			int integer = getInt4(festate->table, start_offest+index*4, &ok);
@@ -767,7 +767,7 @@ static float getFloat4(FILE* table, int offest, bool *ok){
 	return f;
 }
 
-static char* getString32(FILE* table, int offest, bool *ok, bool* isnull){
+static char* getString32(FILE* table, int offest, bool *ok){
 	char *str = (char*) palloc0(sizeof(char)*33);
 	if(fseek(table, offest,SEEK_SET) != 0){
 		printf("seek to start offest str error\n");
@@ -776,12 +776,6 @@ static char* getString32(FILE* table, int offest, bool *ok, bool* isnull){
 	if(fread(str, 32, 1, table) != 1){
 		printf("read str fail\n");
 		*ok = false;
-	}
-
-	// if str is null
-	if(strcmp(str, "") == 0){
-		*isnull = true;
-		return NULL;
 	}
 
 	// set varchar type
