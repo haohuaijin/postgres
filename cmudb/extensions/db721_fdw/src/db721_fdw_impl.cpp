@@ -71,8 +71,8 @@ static void estimateCosts(PlannerInfo* root, RelOptInfo* baserel, db721Metadata*
 static db721ExecutionState* create_db721ExectionState(db721Metadata* meta, char* filename);
 static bool fetchTupleAtIndex(db721ExecutionState* festate, int index, TupleTableSlot* tuple);	
 static int getInt4(FILE* table, int offest, bool* ok);
-static float getFloat4(FILE* table, int offest, bool *ok);
-static char* getString32(FILE* table, int offest, bool *ok);
+static float getFloat4(FILE* table, int offest, bool* ok);
+static char* getString32(FILE* table, int offest, bool* ok, bool* isnull);
 
 extern "C" void db721_GetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
                                       Oid foreigntableid) {
@@ -686,7 +686,6 @@ static db721ExecutionState* create_db721ExectionState(db721Metadata* meta, char*
 	return state;
 }
 
-
 static bool fetchTupleAtIndex(db721ExecutionState* festate, int index, TupleTableSlot* tuple){
 	int total_tuples = 0; // record tuple number
 	for(auto it : *(festate->meta->column_datas)){
@@ -698,11 +697,8 @@ static bool fetchTupleAtIndex(db721ExecutionState* festate, int index, TupleTabl
 	if(total_tuples <= index) {
 		return false;
 	}
-	// printf("total_tuples is %d\n", total_tuples);
 
 	TupleDesc tupleDescriptor = tuple->tts_tupleDescriptor;
-	// tuple->tts_isnull[0] = true; // make index 0 attribute to null
-
 	ExecClearTuple(tuple);
 	for(int i = 0; i < tupleDescriptor->natts; i++){
 		char* name = tupleDescriptor->attrs[i].attname.data; // get attribute name
@@ -714,8 +710,15 @@ static bool fetchTupleAtIndex(db721ExecutionState* festate, int index, TupleTabl
 
 		bool ok = true;
 		if(strcmp(type, "str") == 0){
-			char* str = getString32(festate->table, start_offest+index*32, &ok);
-			tuple->tts_values[i] = CStringGetDatum(str);
+			bool isnull = false;
+			char* str = getString32(festate->table, start_offest+index*32, &ok, &isnull);
+
+			if(isnull){
+				tuple->tts_isnull[i] = true;
+				break;
+			}
+
+			tuple->tts_values[i] = PointerGetDatum(str);
 		} else if(strcmp(type, "int") == 0){
 			int integer = getInt4(festate->table, start_offest+index*4, &ok);
 			tuple->tts_values[i] = Int32GetDatum(integer);
@@ -764,24 +767,33 @@ static float getFloat4(FILE* table, int offest, bool *ok){
 	return f;
 }
 
-static char* getString32(FILE* table, int offest, bool *ok){
-	char *s = (char*) palloc0(sizeof(char)*33);
-	/*
-	 * why postgresql put a string in front of string type ?
-	 * the first char maybe a flag for compress etc.
-	 * how can i know the frist is what
-	 */
-	s[0] = '#'; 	
+static char* getString32(FILE* table, int offest, bool *ok, bool* isnull){
+	char *str = (char*) palloc0(sizeof(char)*33);
 	if(fseek(table, offest,SEEK_SET) != 0){
 		printf("seek to start offest str error\n");
 		*ok = false;
 	}
-	if(fread(s+1, 32, 1, table) != 1){
+	if(fread(str, 32, 1, table) != 1){
 		printf("read str fail\n");
 		*ok = false;
 	}
+
+	// if str is null
+	if(strcmp(str, "") == 0){
+		*isnull = true;
+		return NULL;
+	}
+
+	// set varchar type
+	int input_len = strlen(str);
+	int len = input_len + VARHDRSZ_SHORT;
+	char *result = (char*) palloc0(len);
+	SET_VARSIZE_SHORT(result, len);
+	memcpy(VARDATA_SHORT(result), str, input_len);
+
 	// printf("the str is %s\n", s);
-	return s;
+	pfree(str); // free the memory space
+	return result;
 }
 
 // static void printfMetadata(db721Metadata* meta){
