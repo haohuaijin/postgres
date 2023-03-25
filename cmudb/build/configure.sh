@@ -34,7 +34,7 @@ _parse_configure() {
 
 _configure_debug() {
   set -x
-  ./configure CFLAGS="$CFLAGS_DEBUG" --prefix=$BUILD_DIR --enable-debug --enable-cassert --quiet
+  ./configure CFLAGS="$CFLAGS_DEBUG" --prefix=$BUILD_DIR --with-lz4 --enable-debug --enable-cassert --quiet 
 }
 
 _configure_release() {
