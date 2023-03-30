@@ -20,6 +20,13 @@ extern "C" {
 #include "../../../../src/include/optimizer/planmain.h"
 #include "../../../../src/include/access/relscan.h"
 #include "../../../../src/include/utils/rel.h"
+#include "../../../../src/include/nodes/execnodes.h"
+#include "../../../../src/include/executor/executor.h"
+#include "../../../../src/include/nodes/pathnodes.h"
+#include "../../../../src/include/access/table.h"
+#include "../../../../src/include/parser/parsetree.h"
+#include "../../../../src/include/optimizer/tlist.h"
+#include "../../../../src/include/nodes/makefuncs.h"
 }
 // clang-format on
 
@@ -57,6 +64,7 @@ typedef struct db721ExecutionState {
 	char* filename;
 	FILE* table;
 	int index;
+	List* tlist;
 } db721ExecutionState;
 
 static db721FdwOptions* db721GetOptions(Oid foreigntableid);
@@ -68,11 +76,12 @@ static std::map<std::string, BlockStats*>* parseAllBlockStats(char* metadata, in
 static BlockStats* parseBlockStats(char* metadata, int* index, int size, const char* type);
 // static void printfMetadata(db721Metadata* meta);
 static void estimateCosts(PlannerInfo* root, RelOptInfo* baserel, db721Metadata* fdw_private, Cost* startup_cost, Cost* total_cost);
-static db721ExecutionState* create_db721ExectionState(db721Metadata* meta, char* filename);
-static bool fetchTupleAtIndex(db721ExecutionState* festate, int index, TupleTableSlot* tuple);	
+static db721ExecutionState* create_db721ExectionState(db721Metadata* meta, char* filename, List* tlist);
+static bool fetchTupleAtIndex(ForeignScanState* node, db721ExecutionState* festate, int index, TupleTableSlot* tuple);	
 static int getInt4(FILE* table, int offest, bool* ok);
 static float getFloat4(FILE* table, int offest, bool* ok);
 static char* getString32(FILE* table, int offest, bool* ok);
+static List* getAttributes(Bitmapset* attrs_used, Index relid, PlannerInfo* root);
 
 extern "C" void db721_GetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
                                       Oid foreigntableid) {
@@ -92,9 +101,6 @@ extern "C" void db721_GetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
 
 	// free options
 	pfree(options);
-
-	// printf("tuples number is %lf\n", baserel->tuples);
-	// printf("rows number is %lf\n", baserel->rows);
 }
 
 extern "C" void db721_GetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
@@ -123,18 +129,75 @@ db721_GetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
                    ForeignPath *best_path, List *tlist, List *scan_clauses,
                    Plan *outer_plan) {
 	List *params = NIL;
-	scan_clauses = extract_actual_clauses(scan_clauses, false);
+	ListCell *lc;
+
+	// TODO: add target list(makeTargetEntry), recheck_quals to plan
+	// TODO: store target list and restrict infomation to fdw_private
+
+	// output_list: record the output attributes
+	// restrict_attrs: record the attributes that use for calculate restrict
+	
+	List* fdw_scan_tlist = make_tlist_from_pathtarget(baserel->reltarget);
+	List* output_list= NIL; // use for record output column index
+	foreach(lc, baserel->reltarget->exprs)
+	{
+		Bitmapset* attrs_used = NULL;
+		pull_varattnos((Node *)lfirst(lc), baserel->relid, &attrs_used); // the output columns
+		ListCell* lc2;
+		foreach(lc2, getAttributes(attrs_used, baserel->relid, root))
+		{
+			int attnum = lc2->int_value;
+			output_list = lappend_int(output_list, attnum);
+			printf("attnum %d\n", attnum);
+		}
+	}
+
+	// // restrict infomation
+	// foreach(lc, baserel->baserestrictinfo) 
+	// {
+	// 	RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+	// 	pull_varattnos((Node *) rinfo->clause, baserel->relid, &attrs_used); // the columns used in qual evaluation
+
+	// 	if(IsA(rinfo->clause, OpExpr)){
+	// 		OpExpr *expr = (OpExpr*) rinfo->clause;
+	// 		if(list_length(expr->args) != 2)
+	// 			continue;
+	// 		Expr* left = (Expr*) linitial(expr->args);
+	// 		Expr* right = (Expr*) lsecond(expr->args);
+	// 		while(left && IsA(left, RelabelType))
+	// 			left = ((RelabelType *) left)->arg;
+	// 		while(right && IsA(right, RelabelType))
+	// 			right = ((RelabelType *) right)->arg;
+	// 		if(IsA(left, Var) && IsA(right, Const)){
+	// 			Var* v = (Var*) left;
+	// 			Const* c = (Const*) right;
+	// 			printf("attnum: %d\n", v->varattno);
+	// 		}
+	// 		printf("left type: %d, right type: %d\n", nodeTag(left), nodeTag(right));
+	// 	}
+	// }
+
+	// List* attrs = getAttributes(attrs_used, baserel->relid, root);
+	// foreach(lc, attrs)
+	// {
+	// 	int attnum = lc->int_value;
+	// 	printf("tablename: %s, attnum: %d\n", options->tablename, attnum);
+	// }	
+
+
 
 	db721FdwOptions* options = db721GetOptions(foreigntableid);
 	params = lappend(params, baserel->fdw_private);
 	params = lappend(params, makeString(options->filename));
+	params = lappend(params, output_list);
 
+	scan_clauses = extract_actual_clauses(scan_clauses, false);
 	return make_foreignscan(tlist,
 							scan_clauses,
 							baserel->relid,
 							NIL,
 							params,
-							NIL,
+							fdw_scan_tlist,
 							NIL,
 							outer_plan);
 }
@@ -144,7 +207,8 @@ extern "C" void db721_BeginForeignScan(ForeignScanState *node, int eflags) {
 	db721Metadata* meta = NULL;
 	char* filename = NULL;
 	ForeignScan *plan = (ForeignScan*) node->ss.ps.plan;
-	List *fdw_private = plan->fdw_private;
+	List* fdw_private = plan->fdw_private;
+	List* output_list = NIL;
 	ListCell *lc = NULL;
 	int i = 0; 
 
@@ -158,11 +222,13 @@ extern "C" void db721_BeginForeignScan(ForeignScanState *node, int eflags) {
 			case 1:
 				filename = strVal(lfirst(lc));
 				break;
+			case 2:
+				output_list = (List*)lfirst(lc);
 		}
 		++i;		
 	}
 
-	festate = create_db721ExectionState(meta, filename);
+	festate = create_db721ExectionState(meta, filename, output_list);
 	node->fdw_state = festate;
 }
 
@@ -171,12 +237,8 @@ extern "C" TupleTableSlot *db721_IterateForeignScan(ForeignScanState *node) {
 	TupleTableSlot *tuple = node->ss.ss_ScanTupleSlot;
 	std::string error;
 
-	// only return target value, we can use pushdown
-	// ForeignScan *plan = (ForeignScan*) node->ss.ps.plan;
-	// List *tlist = plan->fdw_scan_tlist; // for SELECT attribute_name FROM table_name;
-
 	try{
-		bool flag = fetchTupleAtIndex(festate, festate->index, tuple);	
+		bool flag = fetchTupleAtIndex(node, festate, festate->index, tuple);	
 		if(!flag){
 			return NULL;
 		}
@@ -192,7 +254,7 @@ extern "C" TupleTableSlot *db721_IterateForeignScan(ForeignScanState *node) {
 
 extern "C" void db721_ReScanForeignScan(ForeignScanState *node) {
 	db721ExecutionState* festate = (db721ExecutionState*) node->fdw_state;
-	festate->index = 1;
+	festate->index = 0;
 }
 
 extern "C" void db721_EndForeignScan(ForeignScanState *node) {
@@ -676,7 +738,7 @@ static void estimateCosts(PlannerInfo* root, RelOptInfo* baserel, db721Metadata*
 	*total_cost = *startup_cost + run_cost;
 }
 
-static db721ExecutionState* create_db721ExectionState(db721Metadata* meta, char* filename){
+static db721ExecutionState* create_db721ExectionState(db721Metadata* meta, char* filename, List* tlist){
 	db721ExecutionState *state = (db721ExecutionState*) palloc0(sizeof(db721ExecutionState));
 
 	FILE* tableFile = AllocateFile(filename, PG_BINARY_R);
@@ -689,11 +751,12 @@ static db721ExecutionState* create_db721ExectionState(db721Metadata* meta, char*
 	state->filename = filename;
 	state->index = 0;
 	state->table = tableFile;
+	state->tlist = tlist;
 
 	return state;
 }
 
-static bool fetchTupleAtIndex(db721ExecutionState* festate, int index, TupleTableSlot* tuple){
+static bool fetchTupleAtIndex(ForeignScanState* node, db721ExecutionState* festate, int index, TupleTableSlot* tuple){
 	int total_tuples = 0; // record tuple number
 	for(auto it : *(festate->meta->column_datas)){
 		for(auto it2 : *(it.second->block_stats)){
@@ -705,15 +768,27 @@ static bool fetchTupleAtIndex(db721ExecutionState* festate, int index, TupleTabl
 		return false;
 	}
 
-	TupleDesc tupleDescriptor = tuple->tts_tupleDescriptor;
+	// only return target value, we can use pushdown
+	ListCell* lc;
+	int i = 0;
+	List* tlist = festate->tlist;
 	ExecClearTuple(tuple);
-	for(int i = 0; i < tupleDescriptor->natts; i++){
-		char* name = tupleDescriptor->attrs[i].attname.data; // get attribute name
+	foreach(lc, tlist)
+	{
+		int attnum = lc->int_value;
+		// printf("att num: %d\n", attnum);
+
+		// TODO: move this to festate
+		// TODO: if the output list have same name, can we reuse the value, and don't read the file
+		Relation rel = node->ss.ss_currentRelation;
+		TupleDesc tupdesc = RelationGetDescr(rel);
+		Form_pg_attribute attr = TupleDescAttr(tupdesc, attnum-1);
+
+		char* name = attr->attname.data;
 		// printf("attribute name is %s\n", name);
 		auto it = (*festate->meta->column_datas)[std::string(name)];
 		char* type = it->type;
 		int start_offest = it->start_offest;
-		// int num_blocks = it->num_blocks; // for larget table
 
 		bool ok = true;
 		if(strcmp(type, "str") == 0){
@@ -732,11 +807,52 @@ static bool fetchTupleAtIndex(db721ExecutionState* festate, int index, TupleTabl
 		if(!ok){
 			return false;
 		}
+		i++;
 	}
 	ExecStoreVirtualTuple(tuple);
-
 	festate->index += 1;
+
+	// ExprContext* econtext = NULL;
+	// ExprState *qual = NULL;
+	// qual = node->ss.ps.qual;
+	// econtext = node->ss.ps.ps_ExprContext;
+
+	// // ResetExprContext(econtext);
+	// econtext->ecxt_scantuple = tuple;
+
+	// if(qual == NULL || ExecQual(qual, econtext)){
+	// 	return true;
+	// } else {
+	// 	return false;
+	// }
+
 	return true;
+}
+
+static List* getAttributes(Bitmapset* attrs_used, Index relid, PlannerInfo* root){
+	// find attribute used
+	RangeTblEntry *rte = planner_rt_fetch(relid, root);
+	Relation rel = table_open(rte->relid, NoLock);
+	TupleDesc tupdesc = RelationGetDescr(rel);
+	bool have_wholerow;
+	int i;
+	List* retrieved_attrs = NIL;
+
+	have_wholerow = bms_is_member(0 - FirstLowInvalidHeapAttributeNumber, attrs_used);
+	for(i = 1; i <= tupdesc->natts; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(tupdesc, i - 1);
+		if(attr->attisdropped){
+			continue;
+		}
+		if(have_wholerow || bms_is_member(i - FirstLowInvalidHeapAttributeNumber, attrs_used))
+		{
+			retrieved_attrs = lappend_int(retrieved_attrs, i);
+		}
+	}
+
+	table_close(rel, NoLock);
+	return retrieved_attrs;
 }
 
 static int getInt4(FILE* table, int offest, bool *ok){
