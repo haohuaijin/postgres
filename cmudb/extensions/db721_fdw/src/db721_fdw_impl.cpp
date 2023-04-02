@@ -27,6 +27,8 @@ extern "C" {
 #include "../../../../src/include/parser/parsetree.h"
 #include "../../../../src/include/optimizer/tlist.h"
 #include "../../../../src/include/nodes/makefuncs.h"
+#include "../../../../src/include/utils/builtins.h"
+#include "../../../../src/include/catalog/pg_operator_d.h"
 }
 // clang-format on
 
@@ -50,7 +52,7 @@ typedef struct ColumnMetadata {
 	char type[32];
 	int start_offest;
 	int num_blocks;
-	std::map<std::string, BlockStats*>* block_stats;
+	std::map<int, BlockStats*>* block_stats;
 } ColumnMetadata;
 
 typedef struct db721Metadata {
@@ -63,11 +65,16 @@ typedef struct db721ExecutionState {
 	db721Metadata* meta;
 	char* filename;
 	FILE* table;
-	int index;
-	Bitmapset* attrs_used; // use for output and quals
-	List* quals; // use for qual
+	int index; 				// the current index
+	int first_index; 		// the scan index, based on block stats
+	int last_index; 		// the last rows index, based on block stats
+	Bitmapset* attrs_used;	// use for output and quals
+	List* quals; 			// for update first index and last index 
 	Relation rel;
 	TupleDesc tupdesc;
+	int total_tuples;
+	ExprState* qual; 		// for ExecQual()
+	Bitmapset* col_used;
 } db721ExecutionState;
 
 static db721FdwOptions* db721GetOptions(Oid foreigntableid);
@@ -75,7 +82,7 @@ static db721Metadata* db721GetMetadata(db721FdwOptions* options);
 static db721Metadata* parserMetadata(char* metadata, int size);
 static std::map<std::string, ColumnMetadata*>* parseAllColumnMetadata(char* metadata, int* index, int size);
 static ColumnMetadata* parseColumnMetadata(char* metadata, int* index, int size);
-static std::map<std::string, BlockStats*>* parseAllBlockStats(char* metadata, int* index, int size, const char* type);
+static std::map<int, BlockStats*>* parseAllBlockStats(char* metadata, int* index, int size, const char* type);
 static BlockStats* parseBlockStats(char* metadata, int* index, int size, const char* type);
 // static void printfMetadata(db721Metadata* meta);
 static void estimateCosts(PlannerInfo* root, RelOptInfo* baserel, db721Metadata* fdw_private, Cost* startup_cost, Cost* total_cost);
@@ -85,6 +92,8 @@ static int getInt4(FILE* table, int offest, bool* ok);
 static float getFloat4(FILE* table, int offest, bool* ok);
 static char* getString32(FILE* table, int offest, bool* ok);
 // static List* getAttributes(Bitmapset* attrs_used, Index relid, PlannerInfo* root);
+static void updateIndexWithBlockStats(db721ExecutionState* festate);
+int min(int a, int b);
 
 extern "C" void db721_GetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
                                       Oid foreigntableid) {
@@ -162,48 +171,19 @@ db721_GetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
 
 extern "C" void db721_BeginForeignScan(ForeignScanState *node, int eflags) {
 	node->fdw_state = create_db721ExectionState(node);
-	// // get expr information
-	// ForeignScan *plan = (ForeignScan*) node->ss.ps.plan;
-	// Index relid = plan->scan.scanrelid;
-	// // Bitmapset* attrs_restrict = NULL;
-	// ListCell* lc;
-	// db721ExecutionState* state = (db721ExecutionState*) node->fdw_state;
-	// foreach(lc, state->quals) 
-	// {
-	// 	// pull_varattnos((Node *) lc, relid, &attrs_restrict); // the columns used in qual evaluation
-	// 	if(IsA(lfirst(lc), OpExpr)){
-	// 		OpExpr* expr = (OpExpr*) lfirst(lc);
-
-	// 		if(list_length(expr->args) != 2)
-	// 			continue;
-	// 		Expr* left = (Expr*) linitial(expr->args);
-	// 		Expr* right = (Expr*) lsecond(expr->args);
-	// 		while(left && IsA(left, RelabelType))
-	// 			left = ((RelabelType *) left)->arg;
-	// 		while(right && IsA(right, RelabelType))
-	// 			right = ((RelabelType *) right)->arg;
-	// 		if(IsA(left, Var) && IsA(right, Const)){
-	// 			Var* v = (Var*) left;
-	// 			Const* c = (Const*) right;
-	// 			if(c->constisnull == false)
-	// 				printf("attnum: %d, opno: %d, value: %f\n", v->varattno, expr->opno, DatumGetFloat4(c->constvalue));
-	// 		}
-	// 		// printf("left type: %d, right type: %d\n", nodeTag(left), nodeTag(right));
-	// 	}
-	// }
+	db721ExecutionState* festate = (db721ExecutionState*) node->fdw_state;
+	updateIndexWithBlockStats(festate);
 }
 
 extern "C" TupleTableSlot *db721_IterateForeignScan(ForeignScanState *node) {
 	db721ExecutionState* festate = (db721ExecutionState*) node->fdw_state;
 	TupleTableSlot *tuple = node->ss.ss_ScanTupleSlot;
 	std::string error;
+	ExprState* qual = festate->qual;
+	ExprContext* econtext = node->ss.ps.ps_ExprContext;
 
 	try{
 		for(;;){
-			ExprState* expr = ExecInitQual(festate->quals, (PlanState*) &node->ss);
-			ExprContext* econtext = node->ss.ps.ps_ExprContext;
-			ExprState *qual = expr;
-
 			bool flag = fetchTupleAtIndex(node, festate, festate->index, tuple);	
 			if(!flag){
 				return NULL;
@@ -219,9 +199,8 @@ extern "C" TupleTableSlot *db721_IterateForeignScan(ForeignScanState *node) {
 		}
 	} catch (std::exception &e) {
 		error = e.what();
-	}
-	if(!error.empty()){
 		printf("catch error: %s\n", error.c_str());
+		return NULL;
 	}
 
  	return tuple;
@@ -229,7 +208,7 @@ extern "C" TupleTableSlot *db721_IterateForeignScan(ForeignScanState *node) {
 
 extern "C" void db721_ReScanForeignScan(ForeignScanState *node) {
 	db721ExecutionState* festate = (db721ExecutionState*) node->fdw_state;
-	festate->index = 0;
+	festate->index = festate->first_index;
 }
 
 extern "C" void db721_EndForeignScan(ForeignScanState *node) {
@@ -249,14 +228,31 @@ extern "C" void db721_EndForeignScan(ForeignScanState *node) {
 }
 
 static bool fetchTupleAtIndex(ForeignScanState* node, db721ExecutionState* festate, int index, TupleTableSlot* tuple){
-	int total_tuples = 0; // record tuple number
-	for(auto it : *(festate->meta->column_datas)){
-		for(auto it2 : *(it.second->block_stats)){
-			total_tuples += it2.second->num;
-		}
-		break;
+	if(festate->total_tuples <= index) {
+		return false;
 	}
-	if(total_tuples <= index) {
+	if(festate->index == festate->last_index) {
+		bool is_read = false;
+		int column_index = festate->index / festate->meta->max_values_per_block;  
+		for(auto it : *(festate->meta->column_datas)){
+			for(unsigned int i = column_index; i < it.second->block_stats->size(); i++){
+				if(!bms_is_member(i, festate->col_used)){
+					is_read = true;
+					festate->first_index = i * festate->meta->max_values_per_block;
+					festate->last_index = min((i+1) * festate->meta->max_values_per_block, festate->total_tuples);
+					break;
+				}
+			}
+			break;
+		}
+		if(!is_read)
+			festate->first_index = festate->last_index;
+		festate->index = festate->first_index;
+		index = festate->index;
+		// printf("index: %d, last index: %d\n", festate->index, festate->last_index);
+	}
+
+	if(festate->total_tuples <= index) {
 		return false;
 	}
 
@@ -301,6 +297,157 @@ static bool fetchTupleAtIndex(ForeignScanState* node, db721ExecutionState* festa
 	return true;
 }
 
+
+static void updateIndexWithBlockStats(db721ExecutionState* festate){
+	// TODO: based on BlockStats to update first_index and last_index
+
+	// very inelegant, can i have a inelegant implement?
+	// float8 operator id
+	// type 701
+	// =  1120
+	// >  1123
+	// <  1122
+	// <> 1121
+	// int operator  id
+	// type 23
+	// =  96
+	// >  521
+	// <  97
+	// <> 518
+	// text operator id
+	// type 25
+	// =  98
+	// >  666
+	// <  664
+	// <> 531
+
+
+	typedef union Value {
+		int i;
+		float8 f;
+		char* s;
+	}Value;
+
+	ListCell* lc;
+	foreach(lc, festate->quals) 
+	{
+		if(IsA(lfirst(lc), OpExpr)){
+			OpExpr* expr = (OpExpr*) lfirst(lc);
+			Expr* left = (Expr*) linitial(expr->args);
+			Expr* right = (Expr*) lsecond(expr->args);
+			Var* v;
+			Const* c;
+
+			while(left && IsA(left, RelabelType)) left = ((RelabelType*)left)->arg; 
+			while(right && IsA(right, RelabelType)) right = ((RelabelType*)right)->arg; 
+
+			if(IsA(left, Var) && IsA(right, Const)){
+				v = (Var*) left;
+				c = (Const*) right;
+			} else { // maybe result error
+				v = (Var*) right;
+				c = (Const*) left;
+			}
+
+			Value value;
+			value.s = (char*)palloc0(32);
+			if(c->consttype == 23){
+				value.i = DatumGetInt32(c->constvalue);
+			} else if (c->consttype == 701) {
+				value.f = DatumGetFloat8(c->constvalue);
+			} else {
+				text* t = (text*)c->constvalue;
+				memcpy(value.s, t->vl_dat, VARSIZE(t)-4);
+			}
+
+			Form_pg_attribute attr = TupleDescAttr(festate->tupdesc, v->varattno - 1);
+			auto col_meta = (*festate->meta->column_datas)[std::string(attr->attname.data)];
+			// int max_values_per_block = festate->meta->max_values_per_block;
+			for(unsigned int i = 0; i < col_meta->block_stats->size(); i++){
+				auto stats = (*col_meta->block_stats)[i];
+				// int tuples = stats->num;
+				bool skip = false;
+
+				if(strcmp(col_meta->type, "str") == 0) {
+					if(expr->opno == 98){ // ==
+						if(strcmp(stats->min.s, value.s) > 0 || strcmp(stats->max.s, value.s) < 0) 
+							skip = true;
+					} else if(expr->opno == 531) { // <>
+						if(strcmp(stats->min.s, value.s) == 0 || strcmp(stats->max.s, value.s) == 0)
+							skip = true;
+					} else if(expr->opno == 664) { // <
+						if(strcmp(stats->min.s, value.s) >= 0)
+							skip = true;
+					} else if(expr->opno == 666) { // >
+						if(strcmp(stats->max.s, value.s) <= 0)
+							skip = true;
+					}
+				} else if(strcmp(col_meta->type, "int") == 0) {
+					if(expr->opno == 96) { 		 // ==
+						if(stats->min.i > value.i || stats->max.i < value.i) 
+							skip = true;
+					} else if(expr->opno == 518) { // <>
+						if(stats->min.i == value.i && stats->max.i == value.i)
+							skip = true;
+					} else if(expr->opno == 97) { // <
+						if(stats->min.i >= value.i)
+							skip = true;
+					} else if(expr->opno == 521) { // >
+						if(stats->max.i <= value.i)
+							skip = true;
+					}
+				} else if(strcmp(col_meta->type, "float") == 0){
+					if(expr->opno == 1120) { 		 // ==
+						if(stats->min.f > value.f || stats->max.f < value.f) 
+							skip = true;
+					} else if(expr->opno == 1121) { // <>
+						if(abs(stats->min.f - value.f) < 0.000001 && abs(stats->max.f - value.f) < 0.000001)
+							skip = true;
+					} else if(expr->opno == 1122) { // <
+						if(stats->min.f > value.f && abs(stats->max.f - value.f) < 0.000001)
+							skip = true;
+					} else if(expr->opno == 1123) { // >
+						if(stats->max.f < value.f || abs(stats->max.f - value.f) < 0.000001)
+							skip = true;
+					}
+				} else {
+					printf("error type\n");
+				}
+
+				if(skip) {
+					// festate->first_index = (i+1) * max_values_per_block;	
+					festate->col_used = bms_add_member(festate->col_used, i);
+					// printf("skip column: %d\n", i);
+				}
+			}
+
+			// printf("attnum: %d, opno: %d, value: %lf\n", v->varattno, expr->opno, DatumGetFloat8(c->constvalue));
+			// printf("attnum: %d, opno: %d, len: %d, value type: %s\n", v->varattno, expr->opno, c->constlen, format_type_be(c->consttype));
+			// text* value = ((text*)c->constvalue);
+			// printf("attnum: %d, len: %d, value %s\n", v->varattno, VARSIZE(value), value->vl_dat);
+			// printf("attnum: %d, opno: %d, funcid: %d, value: %d\n", v->varattno, expr->opno, expr->opfuncid, c->consttype);
+		}
+	}
+
+	bool is_read = false;
+	for(auto it : *(festate->meta->column_datas)){
+		for(unsigned int i = 0; i < it.second->block_stats->size(); i++){
+			if(!bms_is_member(i, festate->col_used)){
+				is_read = true;
+				festate->first_index = i * festate->meta->max_values_per_block;
+				festate->last_index = min((i+1) * festate->meta->max_values_per_block, festate->total_tuples);
+				break;
+			}
+		}
+		break;
+	}
+	if(!is_read)
+		festate->first_index = festate->last_index;
+	// remember update index
+	festate->index = festate->first_index;
+	// printf("index: %d, last index: %d\n", festate->index, festate->last_index);
+}
+
 static db721ExecutionState* create_db721ExectionState(ForeignScanState* node){
 	db721ExecutionState *state = (db721ExecutionState*) palloc0(sizeof(db721ExecutionState));
 	ForeignScan *plan = (ForeignScan*) node->ss.ps.plan;
@@ -332,22 +479,47 @@ static db721ExecutionState* create_db721ExectionState(ForeignScanState* node){
 		++i;		
 	}
 
+	// get table FILE
 	FILE* tableFile = AllocateFile(filename, PG_BINARY_R);
 	if(tableFile == NULL){
 		printf("open file error\n");
 		return nullptr;
 	}
 
+	// calculate total tuples
+	int total_tuples = 0; 
+	for(auto it : *(meta->column_datas)){
+		for(auto it2 : *(it.second->block_stats)){
+			total_tuples += it2.second->num;
+		}
+		break;
+	}
+
+	// make the ExprState
+	ExprState* qual = ExecInitQual(quals, (PlanState*) &node->ss);
+
 	state->meta = meta;
 	state->filename = filename;
 	state->index = 0;
+	state->total_tuples = total_tuples;
+	state->first_index = 0;
+	state->last_index = total_tuples;
 	state->table = tableFile;
 	state->attrs_used = attrs_used; 
 	state->quals = quals;
 	state->rel = node->ss.ss_currentRelation;
 	state->tupdesc = RelationGetDescr(state->rel);
+	state->qual = qual;
 
 	return state;
+}
+
+int min(int a, int b){
+	if(a > b){
+		return b;
+	} else {
+		return a;
+	}
 }
 
 static int getInt4(FILE* table, int offest, bool *ok){
@@ -391,12 +563,12 @@ static char* getString32(FILE* table, int offest, bool *ok){
 
 	// set varchar type
 	int input_len = strlen(str);
-	int len = input_len + VARHDRSZ_SHORT;
+	int len = input_len + VARHDRSZ;
 	char *result = (char*) palloc0(len);
-	SET_VARSIZE_SHORT(result, len);
-	memcpy(VARDATA_SHORT(result), str, input_len);
+	SET_VARSIZE(result, len);
+	memcpy(VARDATA(result), str, input_len);
 
-	// printf("the str is %s\n", s);
+	// printf("len: %d, str: %s\n", len, VARDATA(result));
 	pfree(str); // free the memory space
 	return result;
 }
@@ -716,8 +888,8 @@ static ColumnMetadata* parseColumnMetadata(char* metadata, int* index, int size)
 	return meta;
 }
 
-static std::map<std::string, BlockStats*>* parseAllBlockStats(char* metadata, int* index, int size, const char* type){
-	std::map<std::string, BlockStats*>* stats = new std::map<std::string, BlockStats*>();
+static std::map<int, BlockStats*>* parseAllBlockStats(char* metadata, int* index, int size, const char* type){
+	std::map<int, BlockStats*>* stats = new std::map<int, BlockStats*>();
 	std::stack<char> s;		
 
 	// skip the ':'
@@ -756,9 +928,9 @@ static std::map<std::string, BlockStats*>* parseAllBlockStats(char* metadata, in
 		} else if(c == ':')	{
 			state = 1;
 			key[key_len++] = '\0';
-			// printf("index: %d\n", *index);
-			(*stats)[std::string(key)] = parseBlockStats(metadata, index, size, type);
-			if((*stats)[std::string(key)] == nullptr){
+			// printf("key: %s\n", key);
+			(*stats)[stoi(std::string(key))] = parseBlockStats(metadata, index, size, type);
+			if((*stats)[stoi(std::string(key))] == nullptr){
 				return nullptr;
 			}
 			// printf("index: %d\n", *index);
