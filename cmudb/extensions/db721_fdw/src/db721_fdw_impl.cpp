@@ -28,7 +28,6 @@ extern "C" {
 #include "../../../../src/include/optimizer/tlist.h"
 #include "../../../../src/include/nodes/makefuncs.h"
 #include "../../../../src/include/utils/builtins.h"
-#include "../../../../src/include/catalog/pg_operator_d.h"
 }
 // clang-format on
 
@@ -61,6 +60,11 @@ typedef struct db721Metadata {
 	std::map<std::string, ColumnMetadata*>* column_datas;
 } db721Metadata;
 
+const int TUPLE_LEN = 10;
+typedef struct Tuple {
+	Datum tuple[TUPLE_LEN];
+} Tuple;
+
 typedef struct db721ExecutionState {
 	db721Metadata* meta;
 	char* filename;
@@ -74,9 +78,18 @@ typedef struct db721ExecutionState {
 	TupleDesc tupdesc;
 	int total_tuples;
 	ExprState* qual; 		// for ExecQual()
-	Bitmapset* col_used;
+	Bitmapset* col_used;    // store skip column
+
+	MemoryContext batch_cxt; // for read batch tuples in memory
+
+	// stroe tuples
+	Tuple *tuples;
+	int num_tuples;
+	int next_tuples;
 } db721ExecutionState;
 
+int min(int a, int b);	
+int max(int a, int b);
 static db721FdwOptions* db721GetOptions(Oid foreigntableid);
 static db721Metadata* db721GetMetadata(db721FdwOptions* options);
 static db721Metadata* parserMetadata(char* metadata, int size);
@@ -84,16 +97,11 @@ static std::map<std::string, ColumnMetadata*>* parseAllColumnMetadata(char* meta
 static ColumnMetadata* parseColumnMetadata(char* metadata, int* index, int size);
 static std::map<int, BlockStats*>* parseAllBlockStats(char* metadata, int* index, int size, const char* type);
 static BlockStats* parseBlockStats(char* metadata, int* index, int size, const char* type);
-// static void printfMetadata(db721Metadata* meta);
 static void estimateCosts(PlannerInfo* root, RelOptInfo* baserel, db721Metadata* fdw_private, Cost* startup_cost, Cost* total_cost);
 static db721ExecutionState* create_db721ExectionState(ForeignScanState* node);
 static bool fetchTupleAtIndex(ForeignScanState* node, db721ExecutionState* festate, int index, TupleTableSlot* tuple);	
-static int getInt4(FILE* table, int offest, bool* ok);
-static float getFloat4(FILE* table, int offest, bool* ok);
-static char* getString32(FILE* table, int offest, bool* ok);
-// static List* getAttributes(Bitmapset* attrs_used, Index relid, PlannerInfo* root);
 static void updateIndexWithBlockStats(db721ExecutionState* festate);
-int min(int a, int b);
+static void fetchBatchTuples(ForeignScanState* node, db721ExecutionState* festate);
 
 extern "C" void db721_GetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
                                       Oid foreigntableid) {
@@ -172,7 +180,11 @@ db721_GetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
 extern "C" void db721_BeginForeignScan(ForeignScanState *node, int eflags) {
 	node->fdw_state = create_db721ExectionState(node);
 	db721ExecutionState* festate = (db721ExecutionState*) node->fdw_state;
+	EState	   *estate = node->ss.ps.state;
 	updateIndexWithBlockStats(festate);
+	festate->batch_cxt = AllocSetContextCreate(estate->es_query_cxt,
+												"db721_fdw batch tuple data",
+												ALLOCSET_DEFAULT_SIZES);
 }
 
 extern "C" TupleTableSlot *db721_IterateForeignScan(ForeignScanState *node) {
@@ -234,74 +246,44 @@ static bool fetchTupleAtIndex(ForeignScanState* node, db721ExecutionState* festa
 	if(festate->index == festate->last_index) {
 		bool is_read = false;
 		int column_index = festate->index / festate->meta->max_values_per_block;  
-		for(auto it : *(festate->meta->column_datas)){
-			for(unsigned int i = column_index; i < it.second->block_stats->size(); i++){
-				if(!bms_is_member(i, festate->col_used)){
-					is_read = true;
-					festate->first_index = i * festate->meta->max_values_per_block;
-					festate->last_index = min((i+1) * festate->meta->max_values_per_block, festate->total_tuples);
-					break;
-				}
+		int num_blocks = festate->meta->column_datas->begin()->second->num_blocks;
+		for(int i = column_index; i < num_blocks; i++){
+			if(!bms_is_member(i, festate->col_used)){
+				is_read = true;
+				festate->first_index = i * festate->meta->max_values_per_block;
+				festate->last_index = min((i+1) * festate->meta->max_values_per_block, festate->total_tuples);
+				break;
 			}
-			break;
 		}
 		if(!is_read)
-			festate->first_index = festate->last_index;
+			festate->first_index = festate->total_tuples;
 		festate->index = festate->first_index;
 		index = festate->index;
 		// printf("index: %d, last index: %d\n", festate->index, festate->last_index);
 	}
-
 	if(festate->total_tuples <= index) {
 		return false;
 	}
 
-	// set all att is null, after set to false is need
-	memset(tuple->tts_isnull, true, sizeof(bool)*festate->tupdesc->natts);
+	if(festate->next_tuples >= festate->num_tuples){
+		fetchBatchTuples(node, festate);
+	} 
+
 	ExecClearTuple(tuple);
-	for(int i = 1; i <= festate->tupdesc->natts; i++)
-	{
-		if(!bms_is_member(i - FirstLowInvalidHeapAttributeNumber, festate->attrs_used)){
-			continue;
-		}
-		tuple->tts_isnull[i-1] = false;
-		// printf("att num: %d\n", i-1);
-
-		Form_pg_attribute attr = TupleDescAttr(festate->tupdesc, i-1);
-		char* name = attr->attname.data;
-		// printf("attribute name is %s\n", name);
-		auto it = (*festate->meta->column_datas)[std::string(name)];
-		char* type = it->type;
-		int start_offest = it->start_offest;
-
-		bool ok = true;
-		if(strcmp(type, "str") == 0){
-			char* str = getString32(festate->table, start_offest+index*32, &ok);
-			tuple->tts_values[i-1] = PointerGetDatum(str);
-		} else if(strcmp(type, "int") == 0){
-			int integer = getInt4(festate->table, start_offest+index*4, &ok);
-			tuple->tts_values[i-1] = Int32GetDatum(integer);
-		} else if(strcmp(type, "float") == 0){
-			float f = getFloat4(festate->table, start_offest+index*4, &ok);
-			tuple->tts_values[i-1] = Float4GetDatum(f);
-		} else {
-			printf("error type in fetchTupleAtIndex, type: %s\n", type);
-			return false;
-		}
-		if(!ok){
-			return false;
-		}
+	memset(tuple->tts_isnull, true, sizeof(bool)*festate->tupdesc->natts);
+	for(int i = 1; i <= festate->tupdesc->natts; i++){
+		if(bms_is_member(i - FirstLowInvalidHeapAttributeNumber, festate->attrs_used))
+			tuple->tts_isnull[i-1] = false;
 	}
+	memcpy(tuple->tts_values, festate->tuples[festate->next_tuples++].tuple, sizeof(Datum)*festate->tupdesc->natts);
 	ExecStoreVirtualTuple(tuple);
+
 	festate->index += 1;
 	return true;
 }
 
-
 static void updateIndexWithBlockStats(db721ExecutionState* festate){
-	// TODO: based on BlockStats to update first_index and last_index
-
-	// very inelegant, can i have a inelegant implement?
+	// TODO: very inelegant, can i have a inelegant implement?
 	// float8 operator id
 	// type 701
 	// =  1120
@@ -320,7 +302,6 @@ static void updateIndexWithBlockStats(db721ExecutionState* festate){
 	// >  666
 	// <  664
 	// <> 531
-
 
 	typedef union Value {
 		int i;
@@ -373,7 +354,7 @@ static void updateIndexWithBlockStats(db721ExecutionState* festate){
 						if(strcmp(stats->min.s, value.s) > 0 || strcmp(stats->max.s, value.s) < 0) 
 							skip = true;
 					} else if(expr->opno == 531) { // <>
-						if(strcmp(stats->min.s, value.s) == 0 || strcmp(stats->max.s, value.s) == 0)
+						if(strcmp(stats->min.s, value.s) == 0 && strcmp(stats->max.s, value.s) == 0)
 							skip = true;
 					} else if(expr->opno == 664) { // <
 						if(strcmp(stats->min.s, value.s) >= 0)
@@ -404,7 +385,7 @@ static void updateIndexWithBlockStats(db721ExecutionState* festate){
 						if(abs(stats->min.f - value.f) < 0.000001 && abs(stats->max.f - value.f) < 0.000001)
 							skip = true;
 					} else if(expr->opno == 1122) { // <
-						if(stats->min.f > value.f && abs(stats->max.f - value.f) < 0.000001)
+						if(stats->min.f > value.f || abs(stats->min.f - value.f) < 0.000001)
 							skip = true;
 					} else if(expr->opno == 1123) { // >
 						if(stats->max.f < value.f || abs(stats->max.f - value.f) < 0.000001)
@@ -415,34 +396,24 @@ static void updateIndexWithBlockStats(db721ExecutionState* festate){
 				}
 
 				if(skip) {
-					// festate->first_index = (i+1) * max_values_per_block;	
 					festate->col_used = bms_add_member(festate->col_used, i);
-					// printf("skip column: %d\n", i);
 				}
 			}
-
-			// printf("attnum: %d, opno: %d, value: %lf\n", v->varattno, expr->opno, DatumGetFloat8(c->constvalue));
-			// printf("attnum: %d, opno: %d, len: %d, value type: %s\n", v->varattno, expr->opno, c->constlen, format_type_be(c->consttype));
-			// text* value = ((text*)c->constvalue);
-			// printf("attnum: %d, len: %d, value %s\n", v->varattno, VARSIZE(value), value->vl_dat);
-			// printf("attnum: %d, opno: %d, funcid: %d, value: %d\n", v->varattno, expr->opno, expr->opfuncid, c->consttype);
 		}
 	}
 
 	bool is_read = false;
-	for(auto it : *(festate->meta->column_datas)){
-		for(unsigned int i = 0; i < it.second->block_stats->size(); i++){
-			if(!bms_is_member(i, festate->col_used)){
-				is_read = true;
-				festate->first_index = i * festate->meta->max_values_per_block;
-				festate->last_index = min((i+1) * festate->meta->max_values_per_block, festate->total_tuples);
-				break;
-			}
+	int num_blocks = festate->meta->column_datas->begin()->second->num_blocks;
+	for(int i = 0; i < num_blocks; i++){
+		if(!bms_is_member(i, festate->col_used)){
+			is_read = true;
+			festate->first_index = i * festate->meta->max_values_per_block;
+			festate->last_index = min((i+1) * festate->meta->max_values_per_block, festate->total_tuples);
+			break;
 		}
-		break;
 	}
 	if(!is_read)
-		festate->first_index = festate->last_index;
+		festate->first_index = festate->total_tuples;
 	// remember update index
 	festate->index = festate->first_index;
 	// printf("index: %d, last index: %d\n", festate->index, festate->last_index);
@@ -514,6 +485,84 @@ static db721ExecutionState* create_db721ExectionState(ForeignScanState* node){
 	return state;
 }
 
+static void fetchBatchTuples(ForeignScanState* node, db721ExecutionState* festate){
+	MemoryContext oldcontext;
+	festate->tuples = NULL;
+	MemoryContextReset(festate->batch_cxt);
+	oldcontext = MemoryContextSwitchTo(festate->batch_cxt);
+	int batch_size = 100;
+
+	int index = festate->index;	
+	int first_index = festate->first_index;
+	int last_index = festate->last_index;
+	
+	int numrows = min(batch_size, last_index - first_index);
+
+	festate->tuples = (Tuple*) palloc0(numrows * sizeof(Tuple));
+	festate->num_tuples = numrows;
+	festate->next_tuples = 0;
+
+	for(int i = 1; i <= festate->tupdesc->natts; i++)
+	{
+		if(!bms_is_member(i - FirstLowInvalidHeapAttributeNumber, festate->attrs_used)){
+			continue;
+		}
+
+		Form_pg_attribute attr = TupleDescAttr(festate->tupdesc, i-1);
+		char* name = attr->attname.data;
+		auto it = (*festate->meta->column_datas)[std::string(name)];
+		char* type = it->type;
+		int start_offest = it->start_offest;
+
+		if(strcmp(type, "str") == 0){
+			char* buffer = (char*)palloc0((numrows+1)*32*sizeof(char));
+			if(fseek(festate->table, start_offest+index*32, SEEK_SET) != 0){
+				printf("seek to start offest int error\n");
+			}
+			int read_num = 0;
+			if((read_num = fread(buffer, 32, numrows, festate->table)) != numrows){
+				printf("read str fail\n");
+			}
+			// i-1: attribute, j: tuple index
+			for(int j = 0; j < numrows; j++){
+				int input_len = strlen(buffer+j*32);
+				int len = input_len + VARHDRSZ;
+				char* result = (char*) palloc0(len);
+				SET_VARSIZE(result, len);
+				memcpy(VARDATA(result), buffer+j*32, input_len);
+				festate->tuples[j].tuple[i-1] = PointerGetDatum(result);
+			}
+			pfree(buffer);
+		} else if(strcmp(type, "int") == 0){
+			int buffer[numrows+1];
+			if(fseek(festate->table, start_offest+index*4, SEEK_SET) != 0){
+				printf("seek to start offest int error\n");
+			}
+			if(fread(buffer, 4, numrows, festate->table) != (size_t)numrows){
+				printf("read int fail\n");
+			}
+			// i-1: attribute, j: tuple index
+			for(int j = 0; j < numrows; j++){
+				festate->tuples[j].tuple[i-1] = Int32GetDatum(buffer[j]);
+			}
+		} else if(strcmp(type, "float") == 0){
+			float buffer[numrows+1];
+			if(fseek(festate->table, start_offest+index*4, SEEK_SET) != 0){
+				printf("seek to start offest int error\n");
+			}
+			if(fread(buffer, 4, numrows, festate->table) != (size_t)numrows){
+				printf("read float fail\n");
+			}
+			// i-1: attribute, j: tuple index
+			for(int j = 0; j < numrows; j++){
+				festate->tuples[j].tuple[i-1] = Float4GetDatum(buffer[j]);
+			}
+		}
+	}
+
+	MemoryContextSwitchTo(oldcontext);
+}
+
 int min(int a, int b){
 	if(a > b){
 		return b;
@@ -522,82 +571,13 @@ int min(int a, int b){
 	}
 }
 
-static int getInt4(FILE* table, int offest, bool *ok){
-	int i;
-	if(fseek(table, offest, SEEK_SET) != 0){
-		printf("seek to start offest int error\n");
-		*ok = false;
+int max(int a, int b){
+	if(a > b){
+		return a;
+	} else {
+		return b;
 	}
-	if(fread(&i, 4, 1, table) != 1){
-		printf("read int fail\n");
-		*ok = false;
-	}
-	// printf("the int is %d\n", i);
-	return i;
 }
-
-static float getFloat4(FILE* table, int offest, bool *ok){
-	float f;
-	if(fseek(table, offest, SEEK_SET) != 0){
-		printf("seek to start offest float error\n");
-		*ok = false;
-	}
-	if(fread(&f, 4, 1, table) != 1){
-		printf("read float fail\n");
-		*ok = false;
-	}
-	// printf("the float is %f\n", f);
-	return f;
-}
-
-static char* getString32(FILE* table, int offest, bool *ok){
-	char *str = (char*) palloc0(sizeof(char)*33);
-	if(fseek(table, offest,SEEK_SET) != 0){
-		printf("seek to start offest str error\n");
-		*ok = false;
-	}
-	if(fread(str, 32, 1, table) != 1){
-		printf("read str fail\n");
-		*ok = false;
-	}
-
-	// set varchar type
-	int input_len = strlen(str);
-	int len = input_len + VARHDRSZ;
-	char *result = (char*) palloc0(len);
-	SET_VARSIZE(result, len);
-	memcpy(VARDATA(result), str, input_len);
-
-	// printf("len: %d, str: %s\n", len, VARDATA(result));
-	pfree(str); // free the memory space
-	return result;
-}
-
-// static List* getAttributes(Bitmapset* attrs_used, Index relid, PlannerInfo* root){
-// 	// find attribute used
-// 	RangeTblEntry *rte = planner_rt_fetch(relid, root);
-// 	Relation rel = table_open(rte->relid, NoLock);
-// 	TupleDesc tupdesc = RelationGetDescr(rel);
-// 	bool have_wholerow;
-// 	int i;
-// 	List* retrieved_attrs = NIL;
-
-// 	have_wholerow = bms_is_member(0 - FirstLowInvalidHeapAttributeNumber, attrs_used);
-// 	for(i = 1; i <= tupdesc->natts; i++)
-// 	{
-// 		Form_pg_attribute attr = TupleDescAttr(tupdesc, i - 1);
-// 		if(attr->attisdropped){
-// 			continue;
-// 		}
-// 		if(have_wholerow || bms_is_member(i - FirstLowInvalidHeapAttributeNumber, attrs_used))
-// 		{
-// 			retrieved_attrs = lappend_int(retrieved_attrs, i);
-// 		}
-// 	}
-
-// 	table_close(rel, NoLock);
-// 	return retrieved_attrs;
-// }
 
 static db721FdwOptions* db721GetOptions(Oid foreigntableid){
 	db721FdwOptions* options = nullptr;
@@ -1062,35 +1042,147 @@ static void estimateCosts(PlannerInfo* root, RelOptInfo* baserel, db721Metadata*
 	*total_cost = *startup_cost + run_cost;
 }
 
-// static void printfMetadata(db721Metadata* meta){
-// 	printf("Table name: %s\n", meta->tablename);
-// 	printf("Max Values Per Block %d\n", meta->max_values_per_block);
-// 	printf("Columns: \n");
-// 	for(auto iter : *(meta->column_datas)){
-// 		printf("\tkey: %s\n", iter.first.c_str());
-// 		printf("\t\ttype: %s\n", iter.second->type);
-// 		printf("\t\tnum_blocks: %d\n", iter.second->num_blocks);
-// 		printf("\t\tstart_offest: %d\n", iter.second->start_offest);
-// 		for(auto iter2 : *(iter.second->block_stats)){
-// 			printf("\t\tindex: %s\n", iter2.first.c_str());
-// 			if(strcmp(iter.second->type, "str") == 0){
-// 				printf("\t\t\tnum %d\n", iter2.second->num);
-// 				printf("\t\t\tmin %s\n", iter2.second->min.s);
-// 				printf("\t\t\tmax %s\n", iter2.second->max.s);
-// 				printf("\t\t\tmin_len %d\n", iter2.second->min_len);
-// 				printf("\t\t\tmax_len %d\n", iter2.second->max_len);
-// 			} else if(strcmp(iter.second->type, "float") == 0){
-// 				printf("\t\t\tnum %d\n", iter2.second->num);
-// 				printf("\t\t\tmin %f\n", iter2.second->min.f);
-// 				printf("\t\t\tmax %f\n", iter2.second->max.f);
-// 			} else if(strcmp(iter.second->type, "int") == 0){
-// 				printf("\t\t\tnum %d\n", iter2.second->num);
-// 				printf("\t\t\tmin %d\n", iter2.second->min.i);
-// 				printf("\t\t\tmax %d\n", iter2.second->max.i);
-// 			}
-// 		}
-// 	}
-// }
+/*
+Table name: Chicken
+Max Values Per Block 50000
+Columns:
+        key: age_weeks
+                type: float
+                num_blocks: 3
+                start_offest: 12000000
+                index: 0
+                        num 50000
+                        min 0.000000
+                        max 6.000000
+                index: 1
+                        num 50000
+                        min 0.000000
+                        max 156.000000
+                index: 2
+                        num 20000
+                        min 0.000000
+                        max 155.979996
+        key: farm_name
+                type: str
+                num_blocks: 3
+                start_offest: 480000
+                index: 0
+                        num 50000
+                        min Cheep Birds
+                        max Cheep Birds
+                        min_len 11
+                        max_len 11
+                index: 1
+                        num 50000
+                        min Breakfast Lunch Dinner
+                        max Eggstraordinaire
+                        min_len 11
+                        max_len 22
+                index: 2
+                        num 20000
+                        min Breakfast Lunch Dinner
+                        max Incubator
+                        min_len 9
+                        max_len 22
+        key: identifier
+                type: int
+                num_blocks: 3
+                start_offest: 0
+                index: 0
+                        num 50000
+                        min 1
+                        max 50000
+                index: 1
+                        num 50000
+                        min 50001
+                        max 100000
+                index: 2
+                        num 20000
+                        min 100001
+                        max 120000
+        key: notes
+                type: str
+                num_blocks: 3
+                start_offest: 12960000
+                index: 0
+                        num 50000
+                        min WOODY
+                        max WOODY
+                        min_len 5
+                        max_len 5
+                index: 1
+                        num 50000
+                        min
+                        max WOODY
+                        min_len 0
+                        max_len 5
+                index: 2
+                        num 20000
+                        min
+                        max WOODY
+                        min_len 0
+                        max_len 5
+        key: sex
+                type: str
+                num_blocks: 3
+                start_offest: 8160000
+                index: 0
+                        num 50000
+                        min FEMALE
+                        max MALE
+                        min_len 4
+                        max_len 6
+                index: 1
+                        num 50000
+                        min FEMALE
+                        max MALE
+                        min_len 4
+                        max_len 6
+                index: 2
+                        num 20000
+                        min FEMALE
+                        max MALE
+                        min_len 4
+                        max_len 6
+        key: weight_g
+                type: float
+                num_blocks: 3
+                start_offest: 12480000
+                index: 0
+                        num 50000
+                        min 357.757324
+                        max 3131.530762
+                index: 1
+                        num 50000
+                        min 42.779999
+                        max 3091.312988
+                index: 2
+                        num 20000
+                        min 40.220001
+                        max 3125.401367
+        key: weight_model
+                type: str
+                num_blocks: 3
+                start_offest: 4320000
+                index: 0
+                        num 50000
+                        min GOMPERTZ
+                        max WEIBULL
+                        min_len 3
+                        max_len 8
+                index: 1
+                        num 50000
+                        min GOMPERTZ
+                        max WEIBULL
+                        min_len 3
+                        max_len 8
+                index: 2
+                        num 20000
+                        min GOMPERTZ
+                        max WEIBULL
+                        min_len 3
+                        max_len 8
+*/
 
 /*
 {"Table": "Farm", 
