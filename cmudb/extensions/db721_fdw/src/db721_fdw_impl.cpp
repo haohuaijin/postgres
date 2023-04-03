@@ -351,16 +351,22 @@ static void updateIndexWithBlockStats(db721ExecutionState* festate){
 
 				if(strcmp(col_meta->type, "str") == 0) {
 					if(expr->opno == 98){ // ==
-						if(strcmp(stats->min.s, value.s) > 0 || strcmp(stats->max.s, value.s) < 0) 
+						if(strcoll(stats->min.s, value.s) > 0 || strcoll(stats->max.s, value.s) < 0) 
 							skip = true;
 					} else if(expr->opno == 531) { // <>
-						if(strcmp(stats->min.s, value.s) == 0 && strcmp(stats->max.s, value.s) == 0)
+						if(strcoll(stats->min.s, value.s) == 0 && strcoll(stats->max.s, value.s) == 0)
 							skip = true;
 					} else if(expr->opno == 664) { // <
-						if(strcmp(stats->min.s, value.s) >= 0)
+						// why in postgresql, 'B' > 'b' is true? -> strcoll(): char order based ond LC_COLLATE 
+						// noisepage_db=# select 'B' > 'b';
+						//  ?column? 
+						//  ----------
+						//  t
+						// (1 row)
+						if(strcoll(stats->min.s, value.s) >= 0)
 							skip = true;
 					} else if(expr->opno == 666) { // >
-						if(strcmp(stats->max.s, value.s) <= 0)
+						if(strcoll(stats->max.s, value.s) <= 0)
 							skip = true;
 					}
 				} else if(strcmp(col_meta->type, "int") == 0) {
