@@ -5,6 +5,10 @@
 #include <map>
 #include <stack>
 #include <iostream>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 // clang-format off
 extern "C" {
@@ -69,6 +73,10 @@ typedef struct db721ExecutionState {
 	db721Metadata* meta;
 	char* filename;
 	FILE* table;
+
+	char* mmap_table; // map table file to mmap_table
+	size_t size;      // map file size
+
 	int index; 				// the current index
 	int first_index; 		// the scan index, based on block stats
 	int last_index; 		// the last rows index, based on block stats
@@ -226,6 +234,7 @@ extern "C" void db721_ReScanForeignScan(ForeignScanState *node) {
 extern "C" void db721_EndForeignScan(ForeignScanState *node) {
 	// delete db721Metadata memory that we alloc in db721_GetForeignRelSize
 	db721ExecutionState* festate = (db721ExecutionState*) node->fdw_state;
+	munmap(festate->mmap_table, festate->size);
 	FreeFile(festate->table);
 	db721Metadata *meta = festate->meta;
 	for(auto it1 : *(meta->column_datas)){
@@ -243,6 +252,7 @@ static bool fetchTupleAtIndex(ForeignScanState* node, db721ExecutionState* festa
 	if(festate->total_tuples <= index) {
 		return false;
 	}
+	// check if current batch tuples reach to end
 	if(festate->index == festate->last_index) {
 		bool is_read = false;
 		int column_index = festate->index / festate->meta->max_values_per_block;  
@@ -463,6 +473,22 @@ static db721ExecutionState* create_db721ExectionState(ForeignScanState* node){
 		return nullptr;
 	}
 
+	// use mmap
+	int fd = open(filename, O_RDONLY);
+	if(fd < 0){
+		printf("open failed\n");
+		return nullptr;
+	}
+	struct stat st;
+	fstat(fd, &st);
+	state->size = st.st_size;
+
+	state->mmap_table = static_cast<char*>(mmap(nullptr, state->size, PROT_READ, MAP_SHARED, fd, 0));
+	if (state->mmap_table == MAP_FAILED) {
+        perror("mmap failed");
+        return nullptr;
+    }
+
 	// calculate total tuples
 	int total_tuples = 0; 
 	for(auto it : *(meta->column_datas)){
@@ -521,44 +547,48 @@ static void fetchBatchTuples(ForeignScanState* node, db721ExecutionState* festat
 		int start_offest = it->start_offest;
 
 		if(strcmp(type, "str") == 0){
-			char* buffer = (char*)palloc0((numrows+1)*32*sizeof(char));
-			if(fseek(festate->table, start_offest+index*32, SEEK_SET) != 0){
-				printf("seek to start offest int error\n");
-			}
-			int read_num = 0;
-			if((read_num = fread(buffer, 32, numrows, festate->table)) != numrows){
-				printf("read str fail\n");
-			}
+			// char* buffer = (char*)palloc0((numrows+1)*32*sizeof(char));
+			// if(fseek(festate->table, start_offest+index*32, SEEK_SET) != 0){
+			// 	printf("seek to start offest int error\n");
+			// }
+			// int read_num = 0;
+			// if((read_num = fread(buffer, 32, numrows, festate->table)) != numrows){
+			// 	printf("read str fail\n");
+			// }
+
 			// i-1: attribute, j: tuple index
 			for(int j = 0; j < numrows; j++){
-				int input_len = strlen(buffer+j*32);
+				// int input_len = strlen(buffer+j*32);
+				int input_len = strlen((const char*)festate->mmap_table+start_offest+index*32+j*32);
 				int len = input_len + VARHDRSZ;
 				char* result = (char*) palloc0(len);
 				SET_VARSIZE(result, len);
-				memcpy(VARDATA(result), buffer+j*32, input_len);
+				memcpy(VARDATA(result), festate->mmap_table+start_offest+index*32+j*32, input_len);
 				festate->tuples[j].tuple[i-1] = PointerGetDatum(result);
 			}
-			pfree(buffer);
+			// pfree(buffer);
 		} else if(strcmp(type, "int") == 0){
 			int buffer[numrows+1];
-			if(fseek(festate->table, start_offest+index*4, SEEK_SET) != 0){
-				printf("seek to start offest int error\n");
-			}
-			if(fread(buffer, 4, numrows, festate->table) != (size_t)numrows){
-				printf("read int fail\n");
-			}
+			// if(fseek(festate->table, start_offest+index*4, SEEK_SET) != 0){
+			// 	printf("seek to start offest int error\n");
+			// }
+			// if(fread(buffer, 4, numrows, festate->table) != (size_t)numrows){
+			// 	printf("read int fail\n");
+			// }
+			memcpy(buffer, festate->mmap_table+start_offest+index*4, numrows*4);
 			// i-1: attribute, j: tuple index
 			for(int j = 0; j < numrows; j++){
 				festate->tuples[j].tuple[i-1] = Int32GetDatum(buffer[j]);
 			}
 		} else if(strcmp(type, "float") == 0){
 			float buffer[numrows+1];
-			if(fseek(festate->table, start_offest+index*4, SEEK_SET) != 0){
-				printf("seek to start offest int error\n");
-			}
-			if(fread(buffer, 4, numrows, festate->table) != (size_t)numrows){
-				printf("read float fail\n");
-			}
+			// if(fseek(festate->table, start_offest+index*4, SEEK_SET) != 0){
+			// 	printf("seek to start offest int error\n");
+			// }
+			// if(fread(buffer, 4, numrows, festate->table) != (size_t)numrows){
+			// 	printf("read float fail\n");
+			// }
+			memcpy(buffer, festate->mmap_table+start_offest+index*4, numrows*4);
 			// i-1: attribute, j: tuple index
 			for(int j = 0; j < numrows; j++){
 				festate->tuples[j].tuple[i-1] = Float4GetDatum(buffer[j]);
