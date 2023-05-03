@@ -30,7 +30,7 @@ CREATE FOREIGN TABLE IF NOT EXISTS db721_farm
     max_age_weeks   real
 ) SERVER db721_server OPTIONS
 (
-    filename '/home/iots/hhj/postgres//cmudb/extensions/db721_fdw/data-farms.db721',
+    filename '/home/iots/test/postgres//cmudb/extensions/db721_fdw/data-farms.db721',
     tablename 'Farm'
 );
 CREATE FOREIGN TABLE IF NOT EXISTS db721_chicken (
@@ -43,6 +43,6 @@ CREATE FOREIGN TABLE IF NOT EXISTS db721_chicken (
     notes           varchar
 ) SERVER db721_server OPTIONS
 (
-    filename '/home/iots/hhj/postgres//cmudb/extensions/db721_fdw/data-chickens.db721',
+    filename '/home/iots/test/postgres//cmudb/extensions/db721_fdw/data-chickens.db721',
     tablename 'Chicken'
 );
